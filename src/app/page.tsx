@@ -7,28 +7,6 @@ export default function Home() {
   const [msg, setMsg] = useState<string>("");
   const [mySecret, setMySecret] = useState<string>("");
 
-  async function trigger(env: "preview" | "production") {
-    setLoading(env);
-    setMsg("");
-    try {
-      const res = await fetch("/api/deploy", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ env }),
-      });
-      const data = await res.json();
-      if (data.ok) {
-        setMsg(`✅ ${env} deploy queued with MY_SECRET. Check: ${data.actionsUrl}`);
-      } else {
-        setMsg(`❌ ${data.error}`);
-      }
-    } catch {
-      setMsg("⚠️ Failed to hit /api/deploy");
-    } finally {
-      setLoading(null);
-    }
-  }
-
   async function createForkAndDeploy() {
     if (!mySecret.trim()) {
       setMsg("❌ Please enter a secret value");
@@ -45,12 +23,12 @@ export default function Home() {
       });
       const data = await res.json();
       if (data.ok) {
-        setMsg(`✅ Repository created and deployed! Repo: ${data.repoName}\n🔗 Preview URL: ${data.previewUrl}\n📝 GitHub: ${data.repoUrl}`);
+        setMsg(`✅ Repository forked and deployed! Repo: ${data.repoName}\n🔗 Preview URL: ${data.previewUrl}\n📝 GitHub: ${data.repoUrl}`);
       } else {
         setMsg(`❌ ${data.error}`);
       }
     } catch {
-      setMsg("⚠️ Failed to create repository and deploy");
+      setMsg("⚠️ Failed to fork repository and deploy");
     } finally {
       setLoading(null);
     }
@@ -61,14 +39,14 @@ export default function Home() {
       <div className="max-w-xl w-full space-y-4">
         <h1 className="text-2xl font-semibold">Cloudflare Deploy Demo</h1>
         <p className="text-sm text-gray-500">
-          Create a unique fork and deploy it to Cloudflare with your secret, or deploy existing repo.
+          Fork the repository with your custom name and deploy it to Cloudflare with your secret.
         </p>
 
         {/* Fork and Deploy Section */}
         <div className="border-2 border-green-200 bg-green-50 p-4 rounded-lg space-y-4">
-          <h3 className="font-semibold text-green-800">🚀 Create New Repo & Deploy</h3>
+          <h3 className="font-semibold text-green-800">🚀 Fork Repo & Deploy</h3>
           <p className="text-sm text-green-700">
-            Enter a secret to create a uniquely named repository and deploy it to Cloudflare.
+            Enter a secret to fork the repository with a unique name and deploy it to Cloudflare.
           </p>
           <div className="space-y-3">
             <input
@@ -83,34 +61,9 @@ export default function Home() {
               disabled={!!loading || !mySecret.trim()}
               className="w-full px-4 py-2 rounded-lg shadow bg-green-600 text-white disabled:bg-gray-400 disabled:cursor-not-allowed"
             >
-              {loading === "fork" ? "Creating repository and deploying..." : "Create New Repo & Deploy"}
+              {loading === "fork" ? "Forking repository and deploying..." : "Fork Repo & Deploy"}
             </button>
           </div>
-        </div>
-
-        {/* Existing Deploy Section */}
-        <div className="border-2 border-blue-200 bg-blue-50 p-4 rounded-lg space-y-4">
-          <h3 className="font-semibold text-blue-800">📦 Deploy Existing Repo</h3>
-          <p className="text-sm text-blue-700">
-            Deploy the current repository to different environments.
-          </p>
-          <div className="flex gap-3">
-          <button
-            onClick={() => trigger("preview")}
-            disabled={!!loading}
-            className="px-4 py-2 rounded-xl shadow bg-blue-600 text-white"
-          >
-            {loading === "preview" ? "Deploying preview…" : "Deploy Preview"}
-          </button>
-
-          <button
-            onClick={() => trigger("production")}
-            disabled={!!loading}
-            className="px-4 py-2 rounded-xl shadow bg-green-600 text-white"
-          >
-            {loading === "production" ? "Deploying production…" : "Deploy Production"}
-          </button>
-        </div>
         </div>
 
         {!!msg && <pre className="text-sm p-3 bg-gray-900/90 text-gray-50 rounded-lg whitespace-pre-wrap">{msg}</pre>}

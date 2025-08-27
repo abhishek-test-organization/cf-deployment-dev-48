@@ -38,8 +38,8 @@ export async function POST(req: NextRequest) {
     
     console.log(`Creating fork: ${newRepoName}`);
 
-// Step 1: Create a new repository instead of forking
-const createResponse = await fetch("https://api.github.com/user/repos", {
+// Step 1: Fork the original repository
+const forkResponse = await fetch(`https://api.github.com/repos/${originalOwner}/${originalRepo}/forks`, {
     method: "POST", 
     headers: {
       Authorization: `Bearer ${githubToken}`,
@@ -48,59 +48,46 @@ const createResponse = await fetch("https://api.github.com/user/repos", {
     },
     body: JSON.stringify({
       name: newRepoName,
-      description: `Cloudflare Worker deployment with secret: ${secret}`,
-      private: false,
-      auto_init: true,
+      default_branch_only: true,
     }),
   });
   
-  if (!createResponse.ok) {
-    const errorText = await createResponse.text();
+  if (!forkResponse.ok) {
+    const errorText = await forkResponse.text();
     return NextResponse.json(
-      { ok: false, error: `Failed to create repository: ${errorText}` },
+      { ok: false, error: `Failed to fork repository: ${errorText}` },
       { status: 500 }
     );
   }
   
-  const repoData = await createResponse.json();
+  const repoData = await forkResponse.json();
   const newOwner = repoData.owner.login;
   
-  console.log(`Repository created: ${newOwner}/${newRepoName}`);
+  console.log(`Repository forked: ${newOwner}/${newRepoName}`);
 
     // Wait for repository to be fully initialized
-    console.log('Waiting for repository initialization...');
-    await new Promise(resolve => setTimeout(resolve, 5000));
-
-    // Step 2: Copy all files from original repository
-    console.log('Copying files from original repository...');
-    await copyRepositoryFiles(originalOwner, originalRepo, newOwner, newRepoName);
-    
-    // Step 2.5: Ensure critical files are copied (GitHub workflow)
-    console.log('Ensuring GitHub workflow is copied...');
-    await ensureWorkflowFile(originalOwner, originalRepo, newOwner, newRepoName);
-    
-    // Wait a bit for files to be copied
+    console.log('Waiting for fork to be ready...');
     await new Promise(resolve => setTimeout(resolve, 3000));
 
-    // Step 3: Update wrangler.toml in the new repo
+    // Step 2: Update wrangler.toml in the forked repo
     const updateResponse = await updateWranglerConfig(newOwner, newRepoName, secret, cleanSecret);
     if (!updateResponse.ok) {
       return updateResponse;
     }
 
-    // Step 4: Set up GitHub secrets in the new repo
+    // Step 3: Set up GitHub secrets in the forked repo
     const secretsResponse = await setupGitHubSecrets(newOwner, newRepoName);
     if (!secretsResponse.ok) {
       return secretsResponse;
     }
 
-    // Step 5: Trigger deployment
+    // Step 4: Trigger deployment
     const deployResponse = await triggerDeployment(newOwner, newRepoName);
     if (!deployResponse.ok) {
       return deployResponse;
     }
 
-    // Step 6: Generate preview URL
+    // Step 5: Generate preview URL
     const previewUrl = `https://${originalRepo}-${cleanSecret}-preview.${newOwner}.workers.dev`;
     
     return NextResponse.json({
@@ -108,7 +95,7 @@ const createResponse = await fetch("https://api.github.com/user/repos", {
       repoName: newRepoName,
       repoUrl: `https://github.com/${newOwner}/${newRepoName}`,
       previewUrl,
-      message: "New repository created and deployment triggered successfully!"
+      message: "Repository forked and deployment triggered successfully!"
     });
 
   } catch (error: any) {
@@ -285,177 +272,4 @@ async function encryptSecret(secret: string, publicKey: string): Promise<string>
   
   // Convert back to base64
   return sodium.to_base64(encryptedBytes, sodium.base64_variants.ORIGINAL);
-}
-
-async function copyRepositoryFiles(sourceOwner: string, sourceRepo: string, targetOwner: string, targetRepo: string) {
-  try {
-    // Get all files from original repository tree
-    const treeResponse = await fetch(`https://api.github.com/repos/${sourceOwner}/${sourceRepo}/git/trees/main?recursive=1`, {
-      headers: {
-        Authorization: `Bearer ${githubToken}`,
-        Accept: "application/vnd.github+json",
-      },
-    });
-
-    if (!treeResponse.ok) {
-      throw new Error("Failed to get source repository files");
-    }
-
-    const treeData = await treeResponse.json();
-    
-    console.log(`Found ${treeData.tree.length} items to copy`);
-    
-    // Copy each file (only blobs, not trees/directories)
-    const filesToCopy = treeData.tree.filter((item: any) => 
-      item.type === "blob" && 
-      !item.path.includes('.git/') &&
-      !item.path.startsWith('node_modules/')
-    );
-    
-    console.log(`Found ${filesToCopy.length} files to copy`);
-    
-    for (const item of filesToCopy) {
-      console.log(`Copying file: ${item.path}`);
-      try {
-        await copyFileToNewRepo(sourceOwner, sourceRepo, targetOwner, targetRepo, item.path);
-      } catch (error) {
-        console.warn(`Failed to copy ${item.path}:`, error);
-        // Continue with other files
-      }
-      // Small delay to avoid rate limiting
-      await new Promise(resolve => setTimeout(resolve, 200));
-    }
-
-    console.log('All files copied successfully');
-  } catch (error: any) {
-    console.error('Error copying repository files:', error);
-    throw error;
-  }
-}
-
-async function copyFileToNewRepo(sourceOwner: string, sourceRepo: string, targetOwner: string, targetRepo: string, filePath: string) {
-  try {
-    // Get file content from source repository
-    const getFileResponse = await fetch(`https://api.github.com/repos/${sourceOwner}/${sourceRepo}/contents/${filePath}`, {
-      headers: {
-        Authorization: `Bearer ${githubToken}`,
-        Accept: "application/vnd.github+json",
-      },
-    });
-
-    if (!getFileResponse.ok) {
-      console.warn(`Failed to get file: ${filePath}`);
-      return;
-    }
-
-    const fileData = await getFileResponse.json();
-    
-    // Check if file already exists in target repository
-    let existingSha = null;
-    const checkExistingResponse = await fetch(`https://api.github.com/repos/${targetOwner}/${targetRepo}/contents/${filePath}`, {
-      headers: {
-        Authorization: `Bearer ${githubToken}`,
-        Accept: "application/vnd.github+json",
-      },
-    });
-
-    if (checkExistingResponse.ok) {
-      const existingData = await checkExistingResponse.json();
-      existingSha = existingData.sha;
-    }
-    
-    // Create or update file in target repository
-    const requestBody: any = {
-      message: existingSha ? `Update ${filePath}` : `Add ${filePath}`,
-      content: fileData.content,
-    };
-
-    // Include sha if file exists
-    if (existingSha) {
-      requestBody.sha = existingSha;
-    }
-
-    const createFileResponse = await fetch(`https://api.github.com/repos/${targetOwner}/${targetRepo}/contents/${filePath}`, {
-      method: "PUT",
-      headers: {
-        Authorization: `Bearer ${githubToken}`,
-        Accept: "application/vnd.github+json",
-      },
-      body: JSON.stringify(requestBody),
-    });
-
-    if (!createFileResponse.ok) {
-      const errorText = await createFileResponse.text();
-      console.warn(`Failed to create/update file: ${filePath} - ${errorText}`);
-    }
-  } catch (error) {
-    console.warn(`Error copying file ${filePath}:`, error);
-  }
-}
-
-async function ensureWorkflowFile(sourceOwner: string, sourceRepo: string, targetOwner: string, targetRepo: string) {
-  try {
-    const workflowPath = '.github/workflows/deploy.yml';
-    
-    // Get the workflow file from source
-    const getWorkflowResponse = await fetch(`https://api.github.com/repos/${sourceOwner}/${sourceRepo}/contents/${workflowPath}`, {
-      headers: {
-        Authorization: `Bearer ${githubToken}`,
-        Accept: "application/vnd.github+json",
-      },
-    });
-
-    if (!getWorkflowResponse.ok) {
-      throw new Error('Failed to get workflow file from source repository');
-    }
-
-    const workflowData = await getWorkflowResponse.json();
-    
-    // Check if the workflow file already exists in target repository
-    let existingSha = null;
-    const checkExistingResponse = await fetch(`https://api.github.com/repos/${targetOwner}/${targetRepo}/contents/${workflowPath}`, {
-      headers: {
-        Authorization: `Bearer ${githubToken}`,
-        Accept: "application/vnd.github+json",
-      },
-    });
-
-    if (checkExistingResponse.ok) {
-      const existingData = await checkExistingResponse.json();
-      existingSha = existingData.sha;
-      console.log('Workflow file already exists, updating...');
-    } else {
-      console.log('Creating new workflow file...');
-    }
-    
-    // Create or update the workflow file in target repository
-    const requestBody: any = {
-      message: existingSha ? `Update GitHub Actions workflow` : `Add GitHub Actions workflow`,
-      content: workflowData.content,
-    };
-
-    // Include sha if file exists
-    if (existingSha) {
-      requestBody.sha = existingSha;
-    }
-
-    const createWorkflowResponse = await fetch(`https://api.github.com/repos/${targetOwner}/${targetRepo}/contents/${workflowPath}`, {
-      method: "PUT",
-      headers: {
-        Authorization: `Bearer ${githubToken}`,
-        Accept: "application/vnd.github+json",
-      },
-      body: JSON.stringify(requestBody),
-    });
-
-    if (!createWorkflowResponse.ok) {
-      const errorText = await createWorkflowResponse.text();
-      throw new Error(`Failed to create/update workflow file: ${errorText}`);
-    }
-
-    console.log('GitHub workflow file copied successfully');
-  } catch (error: any) {
-    console.error('Error ensuring workflow file:', error);
-    throw error;
-  }
 }
