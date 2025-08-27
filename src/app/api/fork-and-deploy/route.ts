@@ -36,58 +36,130 @@ export async function POST(req: NextRequest) {
     const cleanSecret = secret.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-');
     const newRepoName = `${originalRepo}-${cleanSecret}`;
     
-    console.log(`Creating fork: ${newRepoName}`);
+    console.log(`Attempting to fork repository in organization: ${newRepoName}`);
 
-// Step 1: Fork the original repository
-const forkResponse = await fetch(`https://api.github.com/repos/${originalOwner}/${originalRepo}/forks`, {
-    method: "POST", 
-    headers: {
-      Authorization: `Bearer ${githubToken}`,
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-    },
-    body: JSON.stringify({
-      name: newRepoName,
-      default_branch_only: true,
-    }),
-  });
-  
-  if (!forkResponse.ok) {
-    const errorText = await forkResponse.text();
-    return NextResponse.json(
-      { ok: false, error: `Failed to fork repository: ${errorText}` },
-      { status: 500 }
-    );
-  }
-  
-  const repoData = await forkResponse.json();
-  const newOwner = repoData.owner.login;
-  
-  console.log(`Repository forked: ${newOwner}/${newRepoName}`);
+    // Step 1: Try to fork first, fallback to create in organization if forking is disabled
+    let repoData;
+    let newOwner;
+    let wasForked = false;
 
-    // Wait for repository to be fully initialized
-    console.log('Waiting for fork to be ready...');
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    try {
+      // Try forking within the organization first
+      const forkResponse = await fetch(`https://api.github.com/repos/${originalOwner}/${originalRepo}/forks`, {
+        method: "POST", 
+        headers: {
+          Authorization: `Bearer ${githubToken}`,
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+        body: JSON.stringify({
+          organization: originalOwner, // Fork within the same organization
+          name: newRepoName,
+          default_branch_only: true,
+        }),
+      });
+      
+      if (forkResponse.ok) {
+        repoData = await forkResponse.json();
+        newOwner = repoData.owner.login;
+        wasForked = true;
+        console.log(`Repository forked successfully in organization: ${newOwner}/${newRepoName}`);
+      } else {
+        const errorResponse = await forkResponse.json();
+        
+        // Check if forking is disabled
+        if (forkResponse.status === 403 && errorResponse.message?.includes("forking is disabled")) {
+          console.log('Forking is disabled, falling back to create repository in organization...');
+          
+          // Try creating in organization first
+          let createResponse = await fetch(`https://api.github.com/orgs/${originalOwner}/repos`, {
+            method: "POST", 
+            headers: {
+              Authorization: `Bearer ${githubToken}`,
+              Accept: "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+            },
+            body: JSON.stringify({
+              name: newRepoName,
+              description: `Cloudflare Worker deployment with secret: ${secret}`,
+              private: false,
+              auto_init: true,
+            }),
+          });
+          
+          // If organization creation fails, fall back to personal account
+          if (!createResponse.ok) {
+            console.log('Failed to create in organization, trying personal account...');
+            createResponse = await fetch("https://api.github.com/user/repos", {
+              method: "POST", 
+              headers: {
+                Authorization: `Bearer ${githubToken}`,
+                Accept: "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+              },
+              body: JSON.stringify({
+                name: newRepoName,
+                description: `Cloudflare Worker deployment with secret: ${secret}`,
+                private: false,
+                auto_init: true,
+              }),
+            });
+          }
+          
+          if (!createResponse.ok) {
+            const errorText = await createResponse.text();
+            throw new Error(`Failed to create repository: ${errorText}`);
+          }
+          
+          repoData = await createResponse.json();
+          newOwner = repoData.owner.login;
+          console.log(`Repository created: ${newOwner}/${newRepoName}`);
+          
+          // Wait for repository initialization
+          await new Promise(resolve => setTimeout(resolve, 5000));
+          
+          // Copy repository content using Git API
+          await copyRepositoryContent(originalOwner, originalRepo, newOwner, newRepoName);
+          
+        } else {
+          throw new Error(`Failed to fork repository: ${JSON.stringify(errorResponse)}`);
+        }
+      }
+    } catch (error: any) {
+      throw new Error(`Repository creation failed: ${error.message}`);
+    }
 
-    // Step 2: Update wrangler.toml in the forked repo
+    // Wait for repository to be ready
+    console.log('Waiting for repository to be ready...');
+    await new Promise(resolve => setTimeout(resolve, wasForked ? 3000 : 2000));
+
+    // Step 2: Enable GitHub Actions (if it was forked)
+    if (wasForked) {
+      const actionsResponse = await enableGitHubActions(originalOwner, newRepoName);
+      if (!actionsResponse.ok) {
+        console.warn('Failed to enable GitHub Actions, but continuing...');
+      }
+    }
+
+    // Step 3: Update wrangler.toml in the new repo
     const updateResponse = await updateWranglerConfig(newOwner, newRepoName, secret, cleanSecret);
     if (!updateResponse.ok) {
       return updateResponse;
     }
 
-    // Step 3: Set up GitHub secrets in the forked repo
+    // Step 4: Set up GitHub secrets in the new repo
     const secretsResponse = await setupGitHubSecrets(newOwner, newRepoName);
     if (!secretsResponse.ok) {
       return secretsResponse;
     }
 
-    // Step 4: Trigger deployment
+    // Step 5: Trigger deployment
     const deployResponse = await triggerDeployment(newOwner, newRepoName);
     if (!deployResponse.ok) {
       return deployResponse;
     }
 
-    // Step 5: Generate preview URL
+    // Step 6: Generate preview URL
     const previewUrl = `https://${originalRepo}-${cleanSecret}-preview.${newOwner}.workers.dev`;
     
     return NextResponse.json({
@@ -95,7 +167,9 @@ const forkResponse = await fetch(`https://api.github.com/repos/${originalOwner}/
       repoName: newRepoName,
       repoUrl: `https://github.com/${newOwner}/${newRepoName}`,
       previewUrl,
-      message: "Repository forked and deployment triggered successfully!"
+      message: wasForked 
+        ? "Repository forked and deployment triggered successfully!" 
+        : "Repository created and deployment triggered successfully!"
     });
 
   } catch (error: any) {
@@ -272,4 +346,143 @@ async function encryptSecret(secret: string, publicKey: string): Promise<string>
   
   // Convert back to base64
   return sodium.to_base64(encryptedBytes, sodium.base64_variants.ORIGINAL);
+}
+
+async function enableGitHubActions(owner: string, repo: string) {
+  try {
+    console.log(`Enabling GitHub Actions for ${owner}/${repo}...`);
+
+    // Step 1: Enable repo-level Actions
+    const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/permissions`, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${githubToken}`,
+        Accept: "application/vnd.github+json",
+      },
+      body: JSON.stringify({
+        enabled: true,
+        allowed_actions: "all",
+      }),
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`Failed to enable Actions: ${err}`);
+    }
+
+    console.log("Actions enabled successfully at repo level");
+    return NextResponse.json({ ok: true });
+  } catch (err: any) {
+    console.error("Error enabling GitHub Actions:", err);
+    return NextResponse.json({ ok: false, error: err.message });
+  }
+}
+
+
+// Efficient repository content copying using Git Trees API
+async function copyRepositoryContent(sourceOwner: string, sourceRepo: string, targetOwner: string, targetRepo: string) {
+  try {
+    console.log('Copying repository content using Git Trees API...');
+    
+    // Get the source repository's main branch tree
+    const sourceTreeResponse = await fetch(`https://api.github.com/repos/${sourceOwner}/${sourceRepo}/git/trees/main?recursive=1`, {
+      headers: {
+        Authorization: `Bearer ${githubToken}`,
+        Accept: "application/vnd.github+json",
+      },
+    });
+
+    if (!sourceTreeResponse.ok) {
+      throw new Error("Failed to get source repository tree");
+    }
+
+    const sourceTree = await sourceTreeResponse.json();
+    
+    // Get target repo's initial commit to get the parent
+    const targetRefsResponse = await fetch(`https://api.github.com/repos/${targetOwner}/${targetRepo}/git/refs/heads/main`, {
+      headers: {
+        Authorization: `Bearer ${githubToken}`,
+        Accept: "application/vnd.github+json",
+      },
+    });
+
+    if (!targetRefsResponse.ok) {
+      throw new Error("Failed to get target repository main branch");
+    }
+
+    const targetRef = await targetRefsResponse.json();
+    const baseCommitSha = targetRef.object.sha;
+    
+    // Create new tree with all source files
+    const createTreeResponse = await fetch(`https://api.github.com/repos/${targetOwner}/${targetRepo}/git/trees`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${githubToken}`,
+        Accept: "application/vnd.github+json",
+      },
+      body: JSON.stringify({
+        tree: sourceTree.tree.filter((item: any) => 
+          item.type === "blob" && 
+          !item.path.includes('.git/') &&
+          !item.path.startsWith('node_modules/') &&
+          item.path !== 'README.md' // Keep the auto-generated README
+        ).map((item: any) => ({
+          path: item.path,
+          mode: item.mode,
+          type: item.type,
+          sha: item.sha
+        }))
+      }),
+    });
+
+    if (!createTreeResponse.ok) {
+      const errorText = await createTreeResponse.text();
+      throw new Error(`Failed to create tree: ${errorText}`);
+    }
+
+    const newTree = await createTreeResponse.json();
+    
+    // Create commit with the new tree
+    const createCommitResponse = await fetch(`https://api.github.com/repos/${targetOwner}/${targetRepo}/git/commits`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${githubToken}`,
+        Accept: "application/vnd.github+json",
+      },
+      body: JSON.stringify({
+        message: `Copy content from ${sourceOwner}/${sourceRepo}`,
+        tree: newTree.sha,
+        parents: [baseCommitSha],
+      }),
+    });
+
+    if (!createCommitResponse.ok) {
+      const errorText = await createCommitResponse.text();
+      throw new Error(`Failed to create commit: ${errorText}`);
+    }
+
+    const newCommit = await createCommitResponse.json();
+    
+    // Update main branch to point to new commit
+    const updateRefResponse = await fetch(`https://api.github.com/repos/${targetOwner}/${targetRepo}/git/refs/heads/main`, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${githubToken}`,
+        Accept: "application/vnd.github+json",
+      },
+      body: JSON.stringify({
+        sha: newCommit.sha,
+      }),
+    });
+
+    if (!updateRefResponse.ok) {
+      const errorText = await updateRefResponse.text();
+      throw new Error(`Failed to update main branch: ${errorText}`);
+    }
+
+    console.log('Repository content copied successfully using Git Trees API');
+  } catch (error: any) {
+    console.error('Error copying repository content:', error);
+    throw error;
+  }
 }
