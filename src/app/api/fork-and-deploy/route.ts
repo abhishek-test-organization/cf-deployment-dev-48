@@ -133,12 +133,10 @@ export async function POST(req: NextRequest) {
     console.log('Waiting for repository to be ready...');
     await new Promise(resolve => setTimeout(resolve, wasForked ? 3000 : 2000));
 
-    // Step 2: Enable GitHub Actions (if it was forked)
-    if (wasForked) {
-      const actionsResponse = await enableGitHubActions(originalOwner, newRepoName);
-      if (!actionsResponse.ok) {
-        console.warn('Failed to enable GitHub Actions, but continuing...');
-      }
+    // Step 2: Create GitHub workflow in the repository 
+    const workflowResponse = await createGitHubWorkflow(newOwner, newRepoName);
+    if (!workflowResponse.ok) {
+      console.warn('Failed to create GitHub workflow, but continuing...');
     }
 
     // Step 3: Update wrangler.toml in the new repo
@@ -348,32 +346,69 @@ async function encryptSecret(secret: string, publicKey: string): Promise<string>
   return sodium.to_base64(encryptedBytes, sodium.base64_variants.ORIGINAL);
 }
 
-async function enableGitHubActions(owner: string, repo: string) {
+async function createGitHubWorkflow(owner: string, repo: string) {
   try {
-    console.log(`Enabling GitHub Actions for ${owner}/${repo}...`);
+    console.log(`Creating GitHub workflow for ${owner}/${repo}...`);
 
-    // Step 1: Enable repo-level Actions
-    const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/permissions`, {
+    const workflowContent = `name: Deploy Cloudflare Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "Environment to deploy"
+        required: true
+        default: "preview"
+        type: choice
+        options:
+          - preview
+          - production
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: workers/hello
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy via Wrangler
+        env:
+          CLOUDFLARE_API_TOKEN: \${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: \${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # MY_SECRET is configured in Cloudflare Dashboard as a secret
+        uses: cloudflare/wrangler-action@v3
+        with:
+          wranglerVersion: "4.32.0"
+          apiToken: \${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: \${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: workers/hello
+          command: deploy --env \${{ inputs.env }}
+          environment: \${{ inputs.env }}`;
+
+    // Create the workflow file
+    const createWorkflowResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/.github/workflows/deploy.yml`, {
       method: "PUT",
       headers: {
         Authorization: `Bearer ${githubToken}`,
         Accept: "application/vnd.github+json",
       },
       body: JSON.stringify({
-        enabled: true,
-        allowed_actions: "all",
+        message: "Add GitHub Actions workflow for Cloudflare deployment",
+        content: Buffer.from(workflowContent).toString('base64'),
       }),
     });
 
-    if (!res.ok) {
-      const err = await res.text();
-      throw new Error(`Failed to enable Actions: ${err}`);
+    if (!createWorkflowResponse.ok) {
+      const err = await createWorkflowResponse.text();
+      throw new Error(`Failed to create workflow: ${err}`);
     }
 
-    console.log("Actions enabled successfully at repo level");
+    console.log("GitHub workflow created successfully");
     return NextResponse.json({ ok: true });
   } catch (err: any) {
-    console.error("Error enabling GitHub Actions:", err);
+    console.error("Error creating GitHub workflow:", err);
     return NextResponse.json({ ok: false, error: err.message });
   }
 }
@@ -425,6 +460,7 @@ async function copyRepositoryContent(sourceOwner: string, sourceRepo: string, ta
           item.type === "blob" && 
           !item.path.includes('.git/') &&
           !item.path.startsWith('node_modules/') &&
+          !item.path.startsWith('.github/workflows/') && // Exclude workflows - we'll create them separately
           item.path !== 'README.md' // Keep the auto-generated README
         ).map((item: any) => ({
           path: item.path,
