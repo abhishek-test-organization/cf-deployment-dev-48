@@ -1,22 +1,22 @@
-name = "cf-demo-worker"
+name = "cf-deployment-dev-48"
 main = "src/worker.js"
 compatibility_date = "2025-08-26"
 account_id = "125b8c582db7b7f2079a38dabfc9cfb3"
 
 [vars]
 ENV = "dev"
-MY_SECRET = "dev-secret"
+MY_SECRET = "PR21nkIN%&lD"
 
 [env.preview]
-name = "cf-demo-worker-preview"   # 👈 give preview its own name
+name = "cf-deployment-dev-48-preview"   # 👈 give preview its own name
 workers_dev = true
 [env.preview.vars]
 ENV = "preview"
-MY_SECRET = "preview-secret"
+MY_SECRET = "PR21nkIN%&lD"
 
 [env.production]
-name = "cf-demo-worker"           # 👈 keep production as the base name
+name = "cf-deployment-dev-48"           # 👈 keep production as the base name
 routes = ["example.com/*"]        # replace later with your domain
 [env.production.vars]
 ENV = "production"
-MY_SECRET = "production-secret"
+MY_SECRET = "PR21nkIN%&lD"
